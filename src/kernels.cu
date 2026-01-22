@@ -3,6 +3,36 @@
 
 #include "../tester/utils.h"
 
+#define CUDA_CHECK(call)                                                                    \
+    {                                                                                       \
+        cudaError_t err = call;                                                             \
+        if (err != cudaSuccess) {                                                           \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__                    \
+                      << " - " << cudaGetErrorString(err) << "\n";                          \
+            exit(-1);                                                                       \
+        }                                                                                   \
+    }
+
+template <typename T>
+__global__ void gpu_trace(const T* input, T* output, size_t skip, size_t N) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    size_t tid = threadIdx.x;
+    const unsigned mask = __activemask();
+
+    T sum = 0;
+    for (size_t i = idx; i < N; i += blockDim.x * gridDim.x) {
+        sum += input[i * skip];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+
+    if (tid % 32 == 0) {
+        atomicAdd(output, sum);
+    }
+}
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -19,8 +49,23 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+    // TODO: Implement the trace function
+    T *cuda_input, *cuda_output;
+    size_t size_bytes = rows * cols * sizeof(T);
+    size_t value_cnt = std::min(rows, cols);
+    CUDA_CHECK(cudaMalloc(&cuda_input, size_bytes));
+    CUDA_CHECK(cudaMalloc(&cuda_output, sizeof(T)));
+    CUDA_CHECK(cudaMemset(cuda_output, 0, sizeof(T)));
+    CUDA_CHECK(cudaMemcpy(cuda_input, h_input.data(), size_bytes, cudaMemcpyHostToDevice));
+
+    dim3 block_dim(256);
+    dim3 grid_dim(std::max(1ul, (value_cnt + block_dim.x - 1) / block_dim.x));
+    gpu_trace<<<grid_dim, block_dim>>>(cuda_input, cuda_output, cols + 1, value_cnt);
+    T output;
+    CUDA_CHECK(cudaMemcpy(&output, cuda_output, sizeof(T), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(cuda_input));
+    CUDA_CHECK(cudaFree(cuda_output));
+    return output;
 }
 
 /**
