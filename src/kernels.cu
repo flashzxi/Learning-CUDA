@@ -21,6 +21,7 @@ __global__ void gpu_trace(const T* input, T* output, size_t skip, size_t N) {
 
     T sum = 0;
     for (size_t i = idx; i < N; i += blockDim.x * gridDim.x) {
+        // 初始化时获取全部的对角线元素，之后就是课上说的求和问题
         sum += input[i * skip];
     }
 
