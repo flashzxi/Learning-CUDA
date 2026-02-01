@@ -133,6 +133,7 @@ __device__ void block_gemm_shared(
                     acc[i][j] += float(A[row * k + kk] * B[col * k + kk]) * factor;
                 }
             }
+            acc[i][j] *= factor;
         }
     }
 
