@@ -19,6 +19,14 @@ __device__ __forceinline__ __half lowest<half>() {
     return __ushort_as_half(0xFC00);
 }
 
+__device__ __forceinline__ bool is_neg_inf(half x) {
+    return (__half_as_ushort(x) == 0xFC00);
+}
+
+__device__ __forceinline__ bool is_neg_inf(float x) {
+    return isinf(x) && x < 0.0f;
+}
+
 #define CUDA_CHECK(call)                                                                    \
     {                                                                                       \
         cudaError_t err = call;                                                             \
@@ -104,8 +112,8 @@ __device__ void block_gemm_shared(
 
     // 4个应该够用了
     // 真实值应该是ceil(BlockM / blockDim.y) ceil(BlockN / blockDim.x)
-    constexpr int max_size_row = BlockSizeQ / BlockDimY;
-    constexpr int max_size_col = BlockSizeKV / BlockDimX;
+    constexpr int max_size_row = 8;
+    constexpr int max_size_col = 8;
     float acc[max_size_row][max_size_col];
 
 #pragma unroll
@@ -210,6 +218,46 @@ __device__ void copy_mem(
     __syncthreads();
 }
 
+template <typename T>
+__device__ void copy_mem_stride(
+        const T* fmem,
+        T* tmem,
+        int len,
+        int head_dim,
+        int stride_in_element
+) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int num_threads = blockDim.y * blockDim.x;
+
+    for (int idx = tid; idx < len; idx += num_threads) {
+        int row_idx = idx / head_dim;
+        int col_idx = idx % head_dim;
+        tmem[idx] = fmem[row_idx * stride_in_element + col_idx];
+    }
+
+    __syncthreads();
+}
+
+template <typename T>
+__device__ void copy_mem_stride_out(
+        const T* fmem,
+        T* tmem,
+        int len,
+        int head_dim,
+        int stride
+) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int num_threads = blockDim.y * blockDim.x;
+
+    for (int idx = tid; idx < len; idx += num_threads) {
+        int row_idx = idx / head_dim;
+        int col_idx = idx % head_dim;
+        tmem[row_idx * stride + col_idx] = fmem[idx];
+    }
+
+    __syncthreads();
+}
+
 // 务必16字节对齐
 template <typename T>
 __device__ void
@@ -248,8 +296,6 @@ __device__ void mask_S(
     int block_rows_cnt,
     int block_cols_cnt
 ) {
-    constexpr float NEG_INF_F = -1e9f;
-
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
     int num_threads = blockDim.x * blockDim.y;
@@ -264,13 +310,6 @@ __device__ void mask_S(
 
         if (k > q) {
             smem_s_block[i * block_cols_cnt + j] = lowest<T>();
-            if constexpr (std::is_same<T, half>::value) {
-                smem_s_block[i * block_cols_cnt + j] =
-                    __float2half(NEG_INF_F);
-            } else {
-                smem_s_block[i * block_cols_cnt + j] =
-                    (T)NEG_INF_F;
-            }
         }
     }
 
@@ -356,9 +395,13 @@ __device__ void safe_exp(
 
     for (int i = idx; i < row_cnt * col_cnt; i += stride) {
         int row = i / col_cnt;
-        float x = (float)(smem_s[i] - smem_m[row]);
-        float e = expf(x);
-        smem_s[i] = (T)e;
+        if (is_neg_inf(smem_s[i])) {
+            smem_s[i] = (T)0;
+        } else {
+            float x = (float)(smem_s[i] - smem_m[row]);
+            float e = expf(x);
+            smem_s[i] = (T)e;
+        }
     }
     __syncthreads();
 }
@@ -404,11 +447,13 @@ __device__ void calc_O(
 
     block_gemm_shared<T, false>(smem_p, smem_v, smem_pv, m, n, k, 1.0f);
 
-    for (int i = idx; i < m * n; i += stride) {
-        int row_idx = i / n;
-        smem_O_ori[i] = 1.0f / float(smem_l_new[row_idx])
-                * (float(smem_l_ori[row_idx]) * expf(float(smem_m_ori[row_idx] - smem_m_new[row_idx])) * float(smem_O_ori[i])
-                    + expf(float(smem_m[row_idx] - smem_m_new[row_idx])) * float(smem_pv[i]));
+    for (int i = idx; i < m * k; i += stride) {
+        int row_idx = i / k;
+        smem_O_ori[i] = T(
+                    (1.0f / float(smem_l_new[row_idx]) *
+                    ( float(smem_l_ori[row_idx]) * expf(float(smem_m_ori[row_idx] - smem_m_new[row_idx])) * float(smem_O_ori[i])
+                      + expf(float(smem_m[row_idx] - smem_m_new[row_idx])) * float(smem_pv[i]) ))
+                );
     }
 
     __syncthreads();
@@ -445,24 +490,22 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
 
     // load Q 分块
     T* q_ptr_batch = param.q + param.size_per_q_batch * batchIdx;
-    T* q_ptr_head = q_ptr_batch + headIdx * param.size_per_q_head;
-    T* q_ptr_block = q_ptr_head + block_idx_q * BlockSizeQ * param.head_dim;
+    T* q_ptr_block = q_ptr_batch + block_idx_q * param.head_dim * param.query_heads * BlockSizeQ;
+    T* q_ptr_head = q_ptr_block + headIdx * param.head_dim;
 
     int q_block_real_len = param.target_seq_len - block_idx_q * BlockSizeQ < BlockSizeQ ?
             param.target_seq_len - block_idx_q * BlockSizeQ : BlockSizeQ;
 
     int64_t q_block_size = q_block_real_len * param.head_dim;
     T* smem_q_block = allocator.allocate(BlockSizeQ * param.head_dim);
-    copy_mem(q_ptr_block, smem_q_block, q_block_size);
+    copy_mem_stride(q_ptr_head, smem_q_block, q_block_size, param.head_dim, param.query_heads * param.head_dim);
 
     // 给KV分内存
     int kv_head_idx = headIdx * param.kv_heads / param.query_heads;
+//    int kv_head_idx = headIdx % param.kv_heads;
 
     T* k_ptr_batch = param.k + param.size_per_kv_batch * batchIdx;
-    T* k_ptr_head = k_ptr_batch + kv_head_idx * param.size_per_kv_head;
-
     T* v_ptr_batch = param.v + param.size_per_kv_batch * batchIdx;
-    T* v_ptr_head = v_ptr_batch + kv_head_idx * param.size_per_kv_head;
 
     T* smem_k_block = allocator.allocate(BlockSizeKV * param.head_dim);
     T* smem_v_block = allocator.allocate(BlockSizeKV * param.head_dim);
@@ -473,7 +516,7 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     // 初始化
     clear_smem_vec(smem_o_block, BlockSizeQ * param.head_dim);
 
-    T* smem_PV = allocator.allocate(BlockSizeQ * BlockSizeKV);
+    T* smem_PV = allocator.allocate(BlockSizeQ * param.head_dim);
     T* smem_m = allocator.allocate(BlockSizeQ);
     T* smem_m_ori = allocator.allocate(BlockSizeQ);
     reset_mem(smem_m_ori, q_block_real_len, lowest<T>());
@@ -491,13 +534,15 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     int kv_block_idx = 0;
     for (int64_t i = 0; i < param.src_seq_len; i += BlockSizeKV, kv_block_idx++) {
         // load K V 分块
-        T* k_ptr_block = k_ptr_head + i * param.head_dim;
-        T* v_ptr_block = v_ptr_head + i * param.head_dim;
+        T* k_ptr_block = k_ptr_batch + i * param.head_dim * param.kv_heads;
+        T* k_ptr_head = k_ptr_block + kv_head_idx * param.head_dim;
+        T* v_ptr_block = v_ptr_batch + i * param.head_dim * param.kv_heads;
+        T* v_ptr_head = v_ptr_block + kv_head_idx * param.head_dim;
         int kv_block_real_len = param.src_seq_len - kv_block_idx * BlockSizeKV < BlockSizeKV ?
                 param.src_seq_len - kv_block_idx * BlockSizeKV : BlockSizeKV;
         size_t kv_block_real_size = kv_block_real_len * param.head_dim;
-        copy_mem(k_ptr_block, smem_k_block, kv_block_real_size);
-        copy_mem(v_ptr_block, smem_v_block, kv_block_real_size);
+        copy_mem_stride(k_ptr_head, smem_k_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
+        copy_mem_stride(v_ptr_head, smem_v_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
         // 计算S block = Q block x K block
         block_gemm_shared<T, true>(smem_q_block, smem_k_block, smem_P, q_block_real_len, head_dim, kv_block_real_len, factor);
         // 设置掩码
@@ -522,9 +567,9 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     // 写出O
     T* O_hbm = param.O
             + batchIdx * param.size_per_q_batch
-            + headIdx * param.size_per_q_head
-            + block_idx_q * BlockSizeQ * param.head_dim;
-    copy_mem(smem_o_block, O_hbm, q_block_size);
+            + block_idx_q * BlockSizeQ * param.head_dim * param.query_heads
+            + headIdx * param.head_dim;
+    copy_mem_stride_out(smem_o_block, O_hbm, q_block_size, param.head_dim, param.query_heads * param.head_dim);
 }
 
 template<typename T>
@@ -536,144 +581,6 @@ void __global__ flash_kernel(FlashAttentionParam<T> param) {
 
     flash_block(param, batch_idx, head_idx, block_idx_q);
 }
-
-template <typename T, int TILE>
-__global__ void gemm_tiled(const T* __restrict__ A,
-                           const T* __restrict__ B,
-                           T* __restrict__ C,
-                           int M, int N, int K) {
-    __shared__ T As[TILE][TILE];
-    __shared__ T Bs[TILE][TILE];
-
-    int row = blockIdx.y * TILE + threadIdx.y;
-    int col = blockIdx.x * TILE + threadIdx.x;
-
-    T acc = static_cast<T>(0);
-
-    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
-        int a_col = t * TILE + threadIdx.x;
-        int b_row = t * TILE + threadIdx.y;
-
-        // load A tile
-        if (row < M && a_col < K)
-            As[threadIdx.y][threadIdx.x] = A[row * K + a_col];
-        else
-            As[threadIdx.y][threadIdx.x] = static_cast<T>(0);
-
-        // load B tile
-        if (b_row < K && col < N)
-            Bs[threadIdx.y][threadIdx.x] = B[b_row * N + col];
-        else
-            Bs[threadIdx.y][threadIdx.x] = static_cast<T>(0);
-
-        __syncthreads();
-
-#pragma unroll
-        for (int k = 0; k < TILE; ++k) {
-            acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    if (row < M && col < N) {
-        C[row * N + col] = acc;
-    }
-}
-
-template <typename T, int TILE>
-__global__ void gemm_tiled_qk(const T* Q, const T* K,
-                              T* S,
-                              int q_len, int kv_len, int head_dim) {
-    // Q: [q_len, head_dim]
-    // K: [kv_len, head_dim]
-    // S: [q_len, kv_len] = Q * K^T
-
-    __shared__ T As[TILE][TILE];
-    __shared__ T Bs[TILE][TILE];
-
-    int row = blockIdx.y * TILE + threadIdx.y; // q
-    int col = blockIdx.x * TILE + threadIdx.x; // kv
-
-    T acc = (T)0;
-
-    for (int t = 0; t < (head_dim + TILE - 1) / TILE; ++t) {
-        int k1 = t * TILE + threadIdx.x;
-        int k2 = t * TILE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] =
-                (row < q_len && k1 < head_dim) ? Q[row * head_dim + k1] : (T)0;
-
-        Bs[threadIdx.y][threadIdx.x] =
-                (col < kv_len && k2 < head_dim) ? K[col * head_dim + k2] : (T)0;
-
-        __syncthreads();
-
-#pragma unroll
-        for (int k = 0; k < TILE; ++k)
-            acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-
-        __syncthreads();
-    }
-
-    if (row < q_len && col < kv_len)
-        S[row * kv_len + col] = acc;
-}
-
-
-template <typename T>
-__global__ void softmax_kernel(T* S, int q_len, int kv_len,
-                               int head_dim, bool is_causal) {
-    int row = blockIdx.x;
-    if (row >= q_len) return;
-
-    T scale = (T)(1.0 / sqrt((double)head_dim));
-    T maxv = (T)(-1e30);
-
-    // max
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        T v = S[row * kv_len + j] * scale;
-        if (is_causal && j > row) v = (T)(-1e30);
-        S[row * kv_len + j] = v;
-        maxv = maxv > v ? maxv : v;
-    }
-
-    __shared__ T smem_max[256];
-    smem_max[threadIdx.x] = maxv;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s)
-            smem_max[threadIdx.x] = smem_max[threadIdx.x] > smem_max[threadIdx.x + s]
-                    ? smem_max[threadIdx.x] : smem_max[threadIdx.x + s];
-        __syncthreads();
-    }
-    maxv = smem_max[0];
-
-    // exp + sum
-    T sum = (T)0;
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        T e = expf(S[row * kv_len + j] - maxv);
-        S[row * kv_len + j] = e;
-        sum += e;
-    }
-
-    __shared__ T smem_sum[256];
-    smem_sum[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s)
-            smem_sum[threadIdx.x] += smem_sum[threadIdx.x + s];
-        __syncthreads();
-    }
-    sum = smem_sum[0];
-
-    // normalize
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x)
-        S[row * kv_len + j] /= sum;
-}
-
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
@@ -691,7 +598,6 @@ __global__ void softmax_kernel(T* S, int q_len, int kv_len,
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
-//#define REAL_FLASH_ATTENTION
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
@@ -699,68 +605,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {
     h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
 
-// flashattention 精度过不了测试，这里提供一个普通的attention
-#ifndef REAL_FLASH_ATTENTION
-    constexpr int TILE = 16;
-
-    size_t q_head_size  = target_seq_len * head_dim;
-    size_t kv_head_size = src_seq_len * head_dim;
-    size_t score_size   = target_seq_len * src_seq_len;
-
-    T *d_q, *d_k, *d_v, *d_s, *d_o;
-    cudaMalloc(&d_q, h_q.size() * sizeof(T));
-    cudaMalloc(&d_k, h_k.size() * sizeof(T));
-    cudaMalloc(&d_v, h_v.size() * sizeof(T));
-    cudaMalloc(&d_o, h_o.size() * sizeof(T));
-    cudaMalloc(&d_s, score_size * sizeof(T));
-
-    cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(T), cudaMemcpyHostToDevice);
-
-    dim3 block(TILE, TILE);
-    dim3 grid_qk((src_seq_len + TILE - 1) / TILE,
-                 (target_seq_len + TILE - 1) / TILE);
-
-    for (int b = 0; b < batch_size; ++b) {
-        for (int qh = 0; qh < query_heads; ++qh) {
-
-            int kvh = (qh * kv_heads) / query_heads;
-
-            const T* q_ptr = d_q + (b * query_heads + qh) * q_head_size;
-            const T* k_ptr = d_k + (b * kv_heads + kvh) * kv_head_size;
-            const T* v_ptr = d_v + (b * kv_heads + kvh) * kv_head_size;
-            T* o_ptr = d_o + (b * query_heads + qh) * q_head_size;
-
-            // 1) S = Q K^T
-            gemm_tiled_qk<T, TILE><<<grid_qk, block>>>(
-                    q_ptr, k_ptr, d_s,
-                    target_seq_len, src_seq_len, head_dim);
-
-            // 2) softmax
-            softmax_kernel<T><<<target_seq_len, 256>>>(
-                    d_s, target_seq_len, src_seq_len,
-                    head_dim, is_causal);
-
-            // 3) O = P V
-            dim3 grid_pv((head_dim + TILE - 1) / TILE,
-                         (target_seq_len + TILE - 1) / TILE);
-
-            gemm_tiled<T, TILE><<<grid_pv, block>>>(
-                    d_s, v_ptr, o_ptr,
-                    target_seq_len, head_dim, src_seq_len);
-        }
-    }
-
-    cudaMemcpy(h_o.data(), d_o, h_o.size() * sizeof(T),
-               cudaMemcpyDeviceToHost);
-
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_s);
-    cudaFree(d_o);
-#else
     // 参考 https://zhuanlan.zhihu.com/p/676655352
     int device;
     cudaGetDevice(&device);
@@ -773,7 +617,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     dim3 grid(num_m_block, batch_size, query_heads);
 
     size_t total_shared_mem_used =
-            sizeof(T) * (2 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 2 * BlockSizeKV * BlockSizeQ + 6 * BlockSizeQ);
+            sizeof(T) * (3 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 6 * BlockSizeQ);
 
     assert(total_shared_mem_used < smem_size);
 
@@ -815,7 +659,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     CUDA_CHECK(cudaFreeAsync(cuda_o, s0));
     CUDA_CHECK(cudaStreamSynchronize(s0));
     CUDA_CHECK(cudaStreamDestroy(s0));
-#endif // #ifndef REAL_FLASH_ATTENTION
 }
 
 // *********************************************************************
