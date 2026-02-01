@@ -14,6 +14,8 @@ template<typename T> __device__ __forceinline__ T lowest();
 
 template<> __device__ __forceinline__ float lowest<float>() { return -INFINITY; }
 
+template<> __device__ __forceinline__ double lowest<double>() { return -INFINITY; }
+
 template<>
 __device__ __forceinline__ __half lowest<half>() {
     return __ushort_as_half(0xFC00);
@@ -128,9 +130,9 @@ __device__ void block_gemm_shared(
             int col = j * dimCol + cCol;
             for (int kk = 0; kk < k; ++kk) {
                 if constexpr (!TransposeB) {
-                    acc[i][j] += float(A[row * k + kk]) * float(B[kk * n + col]);
+                    acc[i][j] += double(A[row * k + kk]) * double(B[kk * n + col]);
                 } else {
-                    acc[i][j] += float(A[row * k + kk]) * float(B[col * k + kk]);
+                    acc[i][j] += double(A[row * k + kk]) * double(B[col * k + kk]);
                 }
             }
             acc[i][j] *= factor;
@@ -222,7 +224,7 @@ __device__ void copy_mem(
 template <typename T>
 __device__ void copy_mem_stride(
         const T* fmem,
-        T* tmem,
+        double* tmem,
         int len,
         int head_dim,
         int stride_in_element
@@ -241,7 +243,7 @@ __device__ void copy_mem_stride(
 
 template <typename T>
 __device__ void copy_mem_stride_out(
-        const T* fmem,
+        const double* fmem,
         T* tmem,
         int len,
         int head_dim,
@@ -335,7 +337,7 @@ __device__ void row_max(
         float local_max = lowest<float>();
 
         for (int col = tx; col < col_cnt; col += col_threads) {
-            float v = float(smem[row * col_cnt + col]);
+            float v = double(smem[row * col_cnt + col]);
             local_max = v > local_max ? v : local_max;
         }
 
@@ -367,10 +369,10 @@ __device__ void row_sum(
 
     // 每个 ty 负责若干行：row = ty + k*row_stride
     for (int row = ty; row < row_cnt; row += row_stride) {
-        float local_sum = T(0);
+        float local_sum = 0.0f;
 
         for (int col = tx; col < col_cnt; col += col_threads) {
-            local_sum += float(smem[row * col_cnt + col]);
+            local_sum += double(smem[row * col_cnt + col]);
         }
         unsigned mask = __activemask();
         for (int offset = col_threads >> 1; offset > 0; offset >>= 1) {
@@ -399,7 +401,7 @@ __device__ void safe_exp(
         if (is_neg_inf(smem_s[i])) {
             smem_s[i] = (T)0;
         } else {
-            float x = (float)(smem_s[i] - smem_m[row]);
+            float x = double(smem_s[i]) - double(smem_m[row]);
             float e = expf(x);
             smem_s[i] = (T)e;
         }
@@ -422,9 +424,9 @@ __device__ void calc_new_m_l(
 
     for (int i = idx; i < row_cnt; i += stride) {
         smem_m_new[i] = smem_m_ori[i] > smem_m[i] ? smem_m_ori[i] : smem_m[i];
-        float h1 = smem_m_ori[i] - smem_m_new[i];
-        float h2 = smem_m[i] - smem_m_new[i];
-        smem_l_new[i] = T(expf(h1) * float(smem_l_ori[i]) + expf(h2) * float(smem_l[i]));
+        float h1 = double(smem_m_ori[i]) - double(smem_m_new[i]);
+        float h2 = double(smem_m[i]) - double(smem_m_new[i]);
+        smem_l_new[i] = T(expf(h1) * double(smem_l_ori[i]) + expf(h2) * double(smem_l[i]));
     }
 
     __syncthreads();
@@ -451,9 +453,9 @@ __device__ void calc_O(
     for (int i = idx; i < m * k; i += stride) {
         int row_idx = i / k;
         smem_O_ori[i] = T(
-                    (1.0f / float(smem_l_new[row_idx]) *
-                    ( float(smem_l_ori[row_idx]) * expf(float(smem_m_ori[row_idx] - smem_m_new[row_idx])) * float(smem_O_ori[i])
-                      + expf(float(smem_m[row_idx] - smem_m_new[row_idx])) * float(smem_pv[i]) ))
+                    (1.0f / double(smem_l_new[row_idx]) *
+                    ( double(smem_l_ori[row_idx]) * expf(double(smem_m_ori[row_idx]) - double(smem_m_new[row_idx])) * double(smem_O_ori[i])
+                      + expf(double(smem_m[row_idx]) - double(smem_m_new[row_idx])) * double(smem_pv[i])))
                 );
     }
 
@@ -486,8 +488,8 @@ private:
 template<typename T>
 void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int headIdx, int block_idx_q) {
     extern __shared__ char smem_[];
-    T* smem_as_T = reinterpret_cast<T*>(smem_);
-    SharedMemAllocator<T> allocator = SharedMemAllocator<T>(smem_as_T);
+    double* smem_as_T = reinterpret_cast<double*>(smem_);
+    SharedMemAllocator<double> allocator = SharedMemAllocator<double>(smem_as_T);
 
     // load Q 分块
     T* q_ptr_batch = param.q + param.size_per_q_batch * batchIdx;
@@ -498,7 +500,7 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
             param.target_seq_len - block_idx_q * BlockSizeQ : BlockSizeQ;
 
     int64_t q_block_size = q_block_real_len * param.head_dim;
-    T* smem_q_block = allocator.allocate(BlockSizeQ * param.head_dim);
+    double* smem_q_block = allocator.allocate(BlockSizeQ * param.head_dim);
     copy_mem_stride(q_ptr_head, smem_q_block, q_block_size, param.head_dim, param.query_heads * param.head_dim);
 
     // 给KV分内存
@@ -508,27 +510,27 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     T* k_ptr_batch = param.k + param.size_per_kv_batch * batchIdx;
     T* v_ptr_batch = param.v + param.size_per_kv_batch * batchIdx;
 
-    T* smem_k_block = allocator.allocate(BlockSizeKV * param.head_dim);
-    T* smem_v_block = allocator.allocate(BlockSizeKV * param.head_dim);
+    double* smem_k_block = allocator.allocate(BlockSizeKV * param.head_dim);
+    double* smem_v_block = allocator.allocate(BlockSizeKV * param.head_dim);
 
     // 中间变量分配内存
     // o的size会变，取最大的BlockSizeQ * BlockSizeKV
-    T* smem_o_block = allocator.allocate(BlockSizeQ * param.head_dim);
+    double* smem_o_block = allocator.allocate(BlockSizeQ * param.head_dim);
     // 初始化
     clear_smem_vec(smem_o_block, BlockSizeQ * param.head_dim);
 
-    T* smem_PV = allocator.allocate(BlockSizeQ * param.head_dim);
-    T* smem_m = allocator.allocate(BlockSizeQ);
-    T* smem_m_ori = allocator.allocate(BlockSizeQ);
-    reset_mem(smem_m_ori, q_block_real_len, lowest<T>());
-    T* smem_m_new = allocator.allocate(BlockSizeQ);
+    double* smem_PV = allocator.allocate(BlockSizeQ * param.head_dim);
+    double* smem_m = allocator.allocate(BlockSizeQ);
+    double* smem_m_ori = allocator.allocate(BlockSizeQ);
+    reset_mem(smem_m_ori, q_block_real_len, lowest<double>());
+    double* smem_m_new = allocator.allocate(BlockSizeQ);
 
-    T* smem_l = allocator.allocate(BlockSizeQ);
-    T* smem_l_new = allocator.allocate(BlockSizeQ);
-    T* smem_l_ori = allocator.allocate(BlockSizeQ);
+    double* smem_l = allocator.allocate(BlockSizeQ);
+    double* smem_l_new = allocator.allocate(BlockSizeQ);
+    double* smem_l_ori = allocator.allocate(BlockSizeQ);
     clear_smem_vec(smem_l_ori, BlockSizeQ);
 
-    T* smem_P =  allocator.allocate(BlockSizeQ * BlockSizeKV);
+    double* smem_P =  allocator.allocate(BlockSizeQ * BlockSizeKV);
 
     int head_dim = param.head_dim;
     float factor = param.factor;
@@ -545,7 +547,7 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
         copy_mem_stride(k_ptr_head, smem_k_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
         copy_mem_stride(v_ptr_head, smem_v_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
         // 计算S block = Q block x K block
-        block_gemm_shared<T, true>(smem_q_block, smem_k_block, smem_P, q_block_real_len, head_dim, kv_block_real_len, factor);
+        block_gemm_shared<double, true>(smem_q_block, smem_k_block, smem_P, q_block_real_len, head_dim, kv_block_real_len, factor);
         // 设置掩码
         if (param.is_causal) {
             mask_S(smem_P, block_idx_q * BlockSizeQ, kv_block_idx * BlockSizeKV, q_block_real_len, kv_block_real_len);
@@ -618,7 +620,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     dim3 grid(num_m_block, batch_size, query_heads);
 
     size_t total_shared_mem_used =
-            sizeof(T) * (3 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 6 * BlockSizeQ);
+            sizeof(double) * (3 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 6 * BlockSizeQ);
 
     assert(total_shared_mem_used < smem_size);
 
