@@ -14,14 +14,14 @@
 PLATFORM        ?= nvidia
 PLATFORM_DEFINE ?= -DPLATFORM_NVIDIA
 STUDENT_SUFFIX  := cu
-CFLAGS          := -std=c++17 -O0
+CFLAGS          := -std=c++17 -O0 -g -G
 EXTRA_LIBS     	:= 
 
 # Compiler & Tester object selection based on PLATFORM
 ifeq ($(PLATFORM),nvidia)
     CC          	:= nvcc
     TEST_OBJ    	:= tester/tester_nv.o
-	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
+	PLATFORM_DEFINE := -DPLATFORM_NVIDIA -arch=sm_89
 else ifeq ($(PLATFORM),iluvatar)
     CC          	:= clang++
 	CFLAGS          := -std=c++17 -O3
