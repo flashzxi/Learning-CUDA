@@ -128,9 +128,9 @@ __device__ void block_gemm_shared(
             int col = j * dimCol + cCol;
             for (int kk = 0; kk < k; ++kk) {
                 if constexpr (!TransposeB) {
-                    acc[i][j] += float(A[row * k + kk] * B[kk * n + col]) * factor;
+                    acc[i][j] += float(A[row * k + kk]) * float(B[kk * n + col]);
                 } else {
-                    acc[i][j] += float(A[row * k + kk] * B[col * k + kk]) * factor;
+                    acc[i][j] += float(A[row * k + kk]) * float(B[col * k + kk]);
                 }
             }
             acc[i][j] *= factor;
@@ -319,7 +319,7 @@ __device__ void mask_S(
 
 template<typename T>
 __device__ void row_max(
-    const T* smem,   // [row_cnt][col_cnt], row-major
+    const T* smem,   // [row_cnt][col_cnt]
     T* o,            // [row_cnt]
     int row_cnt,
     int col_cnt
@@ -354,7 +354,7 @@ __device__ void row_max(
 
 template <typename T>
 __device__ void row_sum(
-    const T* smem,   // [row_cnt][col_cnt], row-major（这里 smem 只是输入指针名，不是 shared memory）
+    const T* smem,   // [row_cnt][col_cnt]
     T* o,            // [row_cnt]
     int row_cnt,
     int col_cnt
