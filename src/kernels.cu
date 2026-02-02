@@ -1,7 +1,69 @@
 #include <vector>
 #include <cuda_fp16.h>
-
+#include <cuda_runtime.h>
 #include "../tester/utils.h"
+#include <cassert>
+#include <cmath>
+
+#define BlockSizeQ 32
+#define BlockSizeKV 32
+#define BlockDimX 16
+#define BlockDimY 16
+#define RunningType float
+
+template<typename T> __device__ __forceinline__ T lowest();
+
+template<> __device__ __forceinline__ float lowest<float>() { return -INFINITY; }
+
+template<> __device__ __forceinline__ double lowest<double>() { return -INFINITY; }
+
+template<>
+__device__ __forceinline__ __half lowest<half>() {
+    return __ushort_as_half(0xFC00);
+}
+
+__device__ __forceinline__ bool is_neg_inf(half x) {
+    return (__half_as_ushort(x) == 0xFC00);
+}
+
+__device__ __forceinline__ bool is_neg_inf(float x) {
+    return isinf(x) && signbit(x);
+}
+
+__device__ __forceinline__ bool is_neg_inf(double x) {
+    return isinf(x) && signbit(x);
+}
+
+#define CUDA_CHECK(call)                                                                    \
+    {                                                                                       \
+        cudaError_t err = call;                                                             \
+        if (err != cudaSuccess) {                                                           \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__                    \
+                      << " - " << cudaGetErrorString(err) << "\n";                          \
+            exit(-1);                                                                       \
+        }                                                                                   \
+    }
+
+template <typename T>
+__global__ void gpu_trace(const T* input, T* output, size_t skip, size_t N) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    size_t tid = threadIdx.x;
+    const unsigned mask = __activemask();
+
+    T sum = 0;
+    for (size_t i = idx; i < N; i += blockDim.x * gridDim.x) {
+        // 初始化时获取全部的对角线元素，之后就是课上说的求和问题
+        sum += input[i * skip];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+
+    if (tid % 32 == 0) {
+        atomicAdd(output, sum);
+    }
+}
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,8 +81,433 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+    // TODO: Implement the trace function
+    T *cuda_input, *cuda_output;
+    size_t size_bytes = rows * cols * sizeof(T);
+    size_t value_cnt = std::min(rows, cols);
+    CUDA_CHECK(cudaMalloc(&cuda_input, size_bytes));
+    CUDA_CHECK(cudaMalloc(&cuda_output, sizeof(T)));
+    CUDA_CHECK(cudaMemset(cuda_output, 0, sizeof(T)));
+    CUDA_CHECK(cudaMemcpy(cuda_input, h_input.data(), size_bytes, cudaMemcpyHostToDevice));
+
+    dim3 block_dim(256);
+    dim3 grid_dim(std::max(1ul, (value_cnt + block_dim.x - 1) / block_dim.x));
+    gpu_trace<<<grid_dim, block_dim>>>(cuda_input, cuda_output, cols + 1, value_cnt);
+    T output;
+    CUDA_CHECK(cudaMemcpy(&output, cuda_output, sizeof(T), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(cuda_input));
+    CUDA_CHECK(cudaFree(cuda_output));
+    return output;
+}
+
+// 单个block的线程合作计算 C = A * B + bias
+template <bool TransposeB>
+__device__ void block_gemm_shared(
+        const RunningType* A,    // [m, k]
+        const RunningType* B,    // [k, n] or [n, k] if TransposeB
+        const RunningType* bias, // [m, n] (optional)
+        RunningType* C,          // [m, n]
+        int m, int k, int n, RunningType factor
+) {
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int dimCol = blockDim.x;
+    int dimRow = blockDim.y;
+
+    for (int row = ty; row < m; row += dimRow) {
+        for (int col = tx; col < n; col += dimCol) {
+            RunningType acc = RunningType(0);
+            for (int kk = 0; kk < k; ++kk) {
+                if constexpr (!TransposeB) {
+                    acc += A[row * k + kk] * B[kk * n + col];
+                } else {
+                    acc += A[row * k + kk] * B[col * k + kk];
+                }
+            }
+            acc *= factor;
+
+            RunningType b = RunningType(0);
+            if (bias != nullptr) {
+                b = bias[row * n + col];
+            }
+            C[row * n + col] = acc + b;
+        }
+    }
+}
+
+template<typename T>
+struct FlashAttentionParam {
+    T* q;
+    T* k;
+    T* v;
+    T* O;
+    int batch_size;
+    int target_seq_len;
+    int src_seq_len;
+    int query_heads;
+    int kv_heads;
+    int head_dim;
+    bool is_causal;
+    size_t size_per_q_batch;
+    size_t size_per_q_head;
+    size_t size_per_kv_batch;
+    size_t size_per_kv_head;
+    float factor;
+
+    FlashAttentionParam(
+        T* q,
+        T* k,
+        T* v,
+        T* O,
+        int batch_size,
+        int target_seq_len,
+        int src_seq_len,
+        int query_heads,
+        int kv_heads,
+        int head_dim,
+        bool is_causal):
+    q(q),
+    k(k),
+    v(v),
+    O(O),
+    batch_size(batch_size),
+    target_seq_len(target_seq_len),
+    src_seq_len(src_seq_len),
+    query_heads(query_heads),
+    kv_heads(kv_heads),
+    head_dim(head_dim),
+    is_causal(is_causal),
+    factor(1.0f / sqrt(head_dim))
+    {
+        size_per_q_batch = target_seq_len * query_heads * head_dim;
+        size_per_q_head = target_seq_len * head_dim;
+
+        size_per_kv_batch = src_seq_len * kv_heads * head_dim;
+        size_per_kv_head = src_seq_len * head_dim;
+
+    }
+};
+
+template<typename T>
+class SharedMemAllocator {
+public:
+    __device__ SharedMemAllocator(T* base): _base_ptr(base), _offset(0) {}
+
+    __device__ T* allocate(size_t size) {
+        T* ret = _base_ptr + _offset;
+        _offset += size;
+        return ret;
+    }
+
+private:
+    T* _base_ptr;
+    size_t _offset;
+};
+
+template <typename T>
+__device__ void copy_mem(
+    const T* fmem,
+    T* tmem,
+    int len
+) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int num_threads = blockDim.y * blockDim.x;
+
+    for (int idx = tid; idx < len; idx += num_threads) {
+        tmem[idx] = fmem[idx];
+    }
+
+    __syncthreads();
+}
+
+template <typename T>
+__device__ void copy_mem_stride(
+        const T* fmem,
+        RunningType* tmem,
+        int len,
+        int head_dim,
+        int stride_in_element
+) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int num_threads = blockDim.y * blockDim.x;
+
+    for (int idx = tid; idx < len; idx += num_threads) {
+        int row_idx = idx / head_dim;
+        int col_idx = idx % head_dim;
+        tmem[idx] = fmem[row_idx * stride_in_element + col_idx];
+    }
+}
+
+template <typename T>
+__device__ void copy_mem_stride_out(
+        const RunningType* fmem,
+        T* tmem,
+        int len,
+        int head_dim,
+        int stride
+) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int num_threads = blockDim.y * blockDim.x;
+
+    for (int idx = tid; idx < len; idx += num_threads) {
+        int row_idx = idx / head_dim;
+        int col_idx = idx % head_dim;
+        tmem[row_idx * stride + col_idx] = fmem[idx];
+    }
+}
+
+template <typename T>
+__device__ void
+reset_mem(T* smem, int len, T value) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * blockDim.y;
+
+    for (int i = tid; i < len; i += stride) {
+        smem[i] = value;
+    }
+    __syncthreads();
+}
+
+// causal mask
+__device__ void mask_s(
+    RunningType* smem_s_block,
+    int block_start_row_idx,
+    int block_start_col_idx,
+    int block_rows_cnt,
+    int block_cols_cnt,
+    int offset
+) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    int num_threads = blockDim.x * blockDim.y;
+    int total_elems = block_rows_cnt * block_cols_cnt;
+
+    for (int idx = tid; idx < total_elems; idx += num_threads) {
+        int i = idx / block_cols_cnt;  // row in block
+        int j = idx % block_cols_cnt;  // col in block
+
+        int q = block_start_row_idx + i + offset;
+        int k = block_start_col_idx + j;
+
+        if (k > q) {
+            smem_s_block[i * block_cols_cnt + j] = lowest<RunningType>();
+        }
+    }
+}
+
+__device__ void cal_m(
+    const RunningType* smem_input_s,   // [row_cnt][col_cnt]
+    const RunningType* smem_m,            // [row_cnt]
+    RunningType* smem_m_new,              // [row_cnt]
+    int row_cnt,
+    int col_cnt
+) {
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int col_threads = blockDim.x;
+    int row_stride  = blockDim.y;
+
+    for (int row = ty; row < row_cnt; row += row_stride) {
+        RunningType local_max = lowest<RunningType>();
+
+        for (int col = tx; col < col_cnt; col += col_threads) {
+            RunningType v = smem_input_s[row * col_cnt + col];
+            local_max = v > local_max ? v : local_max;
+        }
+
+        unsigned mask = __activemask();
+        for (int offset = col_threads >> 1; offset > 0; offset >>= 1) {
+            RunningType other = __shfl_down_sync(mask, local_max, offset, col_threads);
+            local_max = other > local_max ? other : local_max;
+        }
+
+        if (tx == 0) {
+            smem_m_new[row] = smem_m[row] > local_max ? smem_m[row] : local_max;
+        }
+    }
+}
+
+__device__ void safe_exp(
+    RunningType* smem_s,
+    const RunningType* smem_m,
+    int row_cnt,
+    int col_cnt
+) {
+    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * blockDim.y;
+
+    for (int i = idx; i < row_cnt * col_cnt; i += stride) {
+        int row = i / col_cnt;
+        if (is_neg_inf(smem_s[i])) {
+            smem_s[i] = RunningType(0);
+        } else {
+            RunningType x = smem_s[i] - smem_m[row];
+            RunningType e = exp(x);
+            smem_s[i] = e;
+        }
+    }
+}
+
+__device__ void calc_bias_o(
+        RunningType* smem_o,
+        const RunningType* smem_m,
+        const RunningType* smem_m_new,
+        int m, int k
+) {
+    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * blockDim.y;
+
+    for (int i = idx; i < m * k; i += stride) {
+        int row_idx = i / k;
+        smem_o[i] *= exp(smem_m[row_idx] - smem_m_new[row_idx]);
+    }
+}
+
+__device__ void update_l(
+        const RunningType* smem_s, // [row_cnt * col_cnt]
+        const RunningType* smem_m, // [row_cnt]
+        const RunningType* smem_m_new, // [row_cnt]
+        RunningType* smem_l, // [row_cnt * col_cnt] just smem_s
+        int row_cnt,
+        int col_cnt) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * blockDim.y;
+
+    // 先求sum
+    for (int i = tid; i < row_cnt; i += stride) {
+        RunningType sum_s_row = RunningType(0);
+        for (int j = 0; j < col_cnt; ++j) {
+            sum_s_row += smem_s[i * col_cnt + j];
+        }
+        smem_l[i] = exp(smem_m[i] - smem_m_new[i]) * smem_l[i] + sum_s_row;
+    }
+}
+
+__device__ void update_o(
+        RunningType* smem_o_block,
+        const RunningType* smem_l,
+        int row_cnt,
+        int col_cnt) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * blockDim.y;
+
+    for (int i = tid; i < row_cnt * col_cnt; i += stride) {
+        int row = i / col_cnt;
+        smem_o_block[i] /= smem_l[row];
+    }
+}
+
+/**
+ * 一个block内的线程合作计算 (Q_block * K^T) *V
+ * 其中： Q_block = Q[BlockSizeQ * block_idx_q : BlockSizeQ * (blockId + 1), h * hIdx : h * (hIdx + 1)]
+ *
+ * KV会在循环内被拆成小块
+ *      K/V_block = [BlockSizeKV * blockIdN : BlockSize * (blockId + 1), h * hIdx : h * (hIdx + 1)]
+**/
+template<typename T>
+void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int headIdx, int block_idx_q) {
+    extern __shared__ char smem_[];
+    RunningType* smem_as_T = reinterpret_cast<RunningType*>(smem_);
+    SharedMemAllocator<RunningType> allocator = SharedMemAllocator<RunningType>(smem_as_T);
+
+    // load Q 分块
+    T* q_ptr_batch = param.q + param.size_per_q_batch * batchIdx;
+    T* q_ptr_block = q_ptr_batch + block_idx_q * param.head_dim * param.query_heads * BlockSizeQ;
+    T* q_ptr_head = q_ptr_block + headIdx * param.head_dim;
+
+    T* k_ptr_batch = param.k + param.size_per_kv_batch * batchIdx;
+    T* v_ptr_batch = param.v + param.size_per_kv_batch * batchIdx;
+
+    int q_block_real_len = param.target_seq_len - block_idx_q * BlockSizeQ < BlockSizeQ ?
+            param.target_seq_len - block_idx_q * BlockSizeQ : BlockSizeQ;
+    int64_t q_block_size = q_block_real_len * param.head_dim;
+    // 给KV分内存
+    int kv_head_idx = headIdx * param.kv_heads / param.query_heads;
+    //    int kv_head_idx = headIdx % param.kv_heads;
+
+    RunningType* smem_q_block = allocator.allocate(BlockSizeQ * param.head_dim);
+    RunningType* smem_k_block = allocator.allocate(BlockSizeKV * param.head_dim);
+    RunningType* smem_v_block = allocator.allocate(BlockSizeKV * param.head_dim);
+    RunningType* smem_o_block = allocator.allocate(BlockSizeQ * param.head_dim);
+    RunningType* smem_l = allocator.allocate(BlockSizeQ);
+    RunningType* smem_m = allocator.allocate(BlockSizeQ);
+    RunningType* smem_m_new = allocator.allocate(BlockSizeQ);
+    RunningType* smem_s = allocator.allocate(BlockSizeQ * BlockSizeKV);
+    RunningType* smem_p = smem_s; // p and s store at the same place
+
+    // 初始化
+    reset_mem(smem_m, q_block_real_len, lowest<RunningType>());
+    reset_mem(smem_l, q_block_real_len, RunningType(0));
+    reset_mem(smem_o_block, BlockSizeQ * param.head_dim, RunningType(0));
+
+    // load Q_block
+    copy_mem_stride(q_ptr_head, smem_q_block, q_block_size, param.head_dim, param.query_heads * param.head_dim);
+    __syncthreads();
+
+    int head_dim = param.head_dim;
+    RunningType factor = RunningType(1.0) / sqrt(RunningType(param.head_dim));
+    int kv_block_idx = 0;
+    for (int64_t i = 0; i < param.src_seq_len; i += BlockSizeKV, kv_block_idx++) {
+        // load K V 分块
+        T* k_ptr_block = k_ptr_batch + i * param.head_dim * param.kv_heads;
+        T* k_ptr_head = k_ptr_block + kv_head_idx * param.head_dim;
+        T* v_ptr_block = v_ptr_batch + i * param.head_dim * param.kv_heads;
+        T* v_ptr_head = v_ptr_block + kv_head_idx * param.head_dim;
+        int kv_block_real_len = param.src_seq_len - kv_block_idx * BlockSizeKV < BlockSizeKV ?
+                param.src_seq_len - kv_block_idx * BlockSizeKV : BlockSizeKV;
+        size_t kv_block_real_size = kv_block_real_len * param.head_dim;
+        copy_mem_stride(k_ptr_head, smem_k_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
+        __syncthreads();
+        copy_mem_stride(v_ptr_head, smem_v_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
+        __syncthreads();
+        // 计算S block = Q block x K block
+        block_gemm_shared<true>(smem_q_block, smem_k_block, nullptr, smem_s, q_block_real_len, head_dim, kv_block_real_len, factor);
+        __syncthreads();
+        // 设置掩码
+        if (param.is_causal) {
+            mask_s(smem_s, block_idx_q * BlockSizeQ, kv_block_idx * BlockSizeKV,
+                   q_block_real_len, kv_block_real_len, 0);
+            __syncthreads();
+        }
+
+        cal_m(smem_s, smem_m, smem_m_new, q_block_real_len, kv_block_real_len);
+        __syncthreads();
+
+        safe_exp(smem_p, smem_m_new, q_block_real_len, kv_block_real_len);
+        __syncthreads();
+
+        update_l(smem_s, smem_m, smem_m_new, smem_l, q_block_real_len, kv_block_real_len);
+        __syncthreads();
+
+        calc_bias_o(smem_o_block, smem_m, smem_m_new, q_block_real_len, param.head_dim);
+        __syncthreads();
+
+        block_gemm_shared<false>(smem_p, smem_v_block, smem_o_block, smem_o_block, q_block_real_len, kv_block_real_len, head_dim, RunningType(1.0));
+        __syncthreads();
+        // update m
+        copy_mem(smem_m_new, smem_m, q_block_real_len);
+    }
+
+    update_o(smem_o_block, smem_l, q_block_real_len, param.head_dim);
+    __syncthreads();
+    // 写出O
+    T* O_hbm = param.O
+            + batchIdx * param.size_per_q_batch
+            + block_idx_q * BlockSizeQ * param.head_dim * param.query_heads
+            + headIdx * param.head_dim;
+    copy_mem_stride_out(smem_o_block, O_hbm, q_block_size, param.head_dim, param.query_heads * param.head_dim);
+    __syncthreads();
+}
+
+template<typename T>
+void __global__ flash_kernel(FlashAttentionParam<T> param) {
+    // 单个block负责一个Q的一个batch的一个head的一个row Block
+    const int block_idx_q = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int head_idx = blockIdx.z;
+
+    flash_block(param, batch_idx, head_idx, block_idx_q);
 }
 
 /**
@@ -42,9 +529,63 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+    h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
+
+    // 参考 https://zhuanlan.zhihu.com/p/645376942
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device);
+    size_t smem_size = prop.sharedMemPerBlock;
+    dim3 block_dim(BlockDimX, BlockDimY);
+    const int num_m_block = (target_seq_len + BlockSizeQ - 1) / BlockSizeQ;
+    dim3 grid(num_m_block, batch_size, query_heads);
+
+    size_t total_shared_mem_used =
+            sizeof(RunningType) * (2 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 4 * BlockSizeQ);
+
+    assert(total_shared_mem_used < smem_size);
+
+    cudaStream_t s0 = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&s0));
+
+    T *cuda_q, *cuda_k, *cuda_v, *cuda_o;
+    CUDA_CHECK(cudaMallocAsync(&cuda_q, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, s0));
+    CUDA_CHECK(cudaMallocAsync(&cuda_o, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, s0));
+    CUDA_CHECK(cudaMallocAsync(&cuda_k, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, s0));
+    CUDA_CHECK(cudaMallocAsync(&cuda_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, s0));
+
+    CUDA_CHECK(cudaMemcpyAsync(cuda_q, h_q.data(), sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, cudaMemcpyHostToDevice, s0))
+    CUDA_CHECK(cudaMemcpyAsync(cuda_k, h_k.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, cudaMemcpyHostToDevice, s0))
+    CUDA_CHECK(cudaMemcpyAsync(cuda_v, h_v.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, cudaMemcpyHostToDevice, s0))
+
+
+    FlashAttentionParam<T> param(
+            cuda_q,
+            cuda_k,
+            cuda_v,
+            cuda_o,
+            batch_size,
+            target_seq_len,
+            src_seq_len,
+            query_heads,
+            kv_heads,
+            head_dim,
+            is_causal);
+
+    flash_kernel<<<grid, block_dim, total_shared_mem_used, s0>>>(param);
+    CUDA_CHECK(cudaMemcpyAsync(h_o.data(), param.O, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, cudaMemcpyDeviceToHost, s0))
+
+    CUDA_CHECK(cudaStreamSynchronize(s0));
+
+    CUDA_CHECK(cudaFreeAsync(cuda_q, s0));
+    CUDA_CHECK(cudaFreeAsync(cuda_k, s0));
+    CUDA_CHECK(cudaFreeAsync(cuda_v, s0));
+    CUDA_CHECK(cudaFreeAsync(cuda_o, s0));
+    CUDA_CHECK(cudaStreamSynchronize(s0));
+    CUDA_CHECK(cudaStreamDestroy(s0));
 }
 
 // *********************************************************************
