@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include "../tester/utils.h"
 #include <cassert>
+#include <cmath>
 
 #define BlockSizeQ 32
 #define BlockSizeKV 32
@@ -273,7 +274,8 @@ __device__ void mask_s(
     int block_start_row_idx,
     int block_start_col_idx,
     int block_rows_cnt,
-    int block_cols_cnt
+    int block_cols_cnt,
+    int offset
 ) {
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
@@ -284,7 +286,7 @@ __device__ void mask_s(
         int i = idx / block_cols_cnt;  // row in block
         int j = idx % block_cols_cnt;  // col in block
 
-        int q = block_start_row_idx + i;
+        int q = block_start_row_idx + i + offset;
         int k = block_start_col_idx + j;
 
         if (k > q) {
@@ -464,7 +466,8 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
         __syncthreads();
         // 设置掩码
         if (param.is_causal) {
-            mask_s(smem_s, block_idx_q * BlockSizeQ, kv_block_idx * BlockSizeKV, q_block_real_len, kv_block_real_len);
+            mask_s(smem_s, block_idx_q * BlockSizeQ, kv_block_idx * BlockSizeKV,
+                   q_block_real_len, kv_block_real_len, 0);
             __syncthreads();
         }
 
@@ -533,10 +536,9 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     // 参考 https://zhuanlan.zhihu.com/p/645376942
     int device;
     cudaGetDevice(&device);
-    cudaDeviceProp prop;
+    cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, device);
     size_t smem_size = prop.sharedMemPerBlock;
-    // 为了简单起见，假设Q分块和KV分块一样大
     dim3 block_dim(BlockDimX, BlockDimY);
     const int num_m_block = (target_seq_len + BlockSizeQ - 1) / BlockSizeQ;
     dim3 grid(num_m_block, batch_size, query_heads);
