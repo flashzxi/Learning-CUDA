@@ -540,7 +540,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {
     h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
 
-    // 参考 https://zhuanlan.zhihu.com/p/676655352
+    // 参考 https://zhuanlan.zhihu.com/p/645376942
     int device;
     cudaGetDevice(&device);
     cudaDeviceProp prop;
