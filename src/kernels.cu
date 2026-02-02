@@ -9,6 +9,7 @@
 #define BlockSizeKV 32
 #define BlockDimX 16
 #define BlockDimY 16
+#define RunningType double
 
 template<typename T> __device__ __forceinline__ T lowest();
 
@@ -27,6 +28,10 @@ __device__ __forceinline__ bool is_neg_inf(half x) {
 
 __device__ __forceinline__ bool is_neg_inf(float x) {
     return isinf(x) && x < 0.0f;
+}
+
+__device__ __forceinline__ bool is_neg_inf(double x) {
+    return isinf(x) && x < 0.0lf;
 }
 
 #define CUDA_CHECK(call)                                                                    \
@@ -95,13 +100,14 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     return output;
 }
 
-// 单个block的线程合作计算 C = A * B
-template <typename T, bool TransposeB>
+// 单个block的线程合作计算 C = A * B + bias
+template <bool TransposeB>
 __device__ void block_gemm_shared(
-    const T* A,   // shared mem: [m, k]
-    const T* B,   // shared mem: [k, n] or [n, k]
-    T* C,         // shared mem: [m, n]
-    int m, int k, int n, float factor
+    const RunningType* A,   // shared mem: [m, k]
+    const RunningType* B,   // shared mem: [k, n] or [n, k]
+    const RunningType* bias, // shared mem: [m, n]
+    RunningType* C,         // shared mem: [m, n]
+    int m, int k, int n, RunningType factor
 ) {
     int cRow = threadIdx.y;
     int cCol = threadIdx.x;
@@ -114,9 +120,9 @@ __device__ void block_gemm_shared(
 
     // 4个应该够用了
     // 真实值应该是ceil(BlockM / blockDim.y) ceil(BlockN / blockDim.x)
-    constexpr int max_size_row = 8;
-    constexpr int max_size_col = 8;
-    float acc[max_size_row][max_size_col];
+    constexpr int max_size_row = 4;
+    constexpr int max_size_col = 4;
+    RunningType acc[max_size_row][max_size_col];
 
 #pragma unroll
     for (int i = 0; i < max_size_row; ++i)
@@ -130,9 +136,9 @@ __device__ void block_gemm_shared(
             int col = j * dimCol + cCol;
             for (int kk = 0; kk < k; ++kk) {
                 if constexpr (!TransposeB) {
-                    acc[i][j] += double(A[row * k + kk]) * double(B[kk * n + col]);
+                    acc[i][j] += A[row * k + kk] * B[kk * n + col];
                 } else {
-                    acc[i][j] += double(A[row * k + kk]) * double(B[col * k + kk]);
+                    acc[i][j] += A[row * k + kk] * B[col * k + kk];
                 }
             }
             acc[i][j] *= factor;
@@ -144,11 +150,14 @@ __device__ void block_gemm_shared(
         for (int j = 0; j < col_cnt; ++j) {
             int col = cCol + j * dimCol;
             if (row < m && col < n) {
-                C[row * n + col] = (T)acc[i][j];
+                RunningType b = RunningType(0);
+                if (bias != nullptr) {
+                    b = bias[row * n + col];
+                }
+                C[row * n + col] = acc[i][j] + b;
             }
         }
     }
-    __syncthreads();
 }
 
 template<typename T>
@@ -204,7 +213,22 @@ struct FlashAttentionParam {
     }
 };
 
-// 从hbm load 连续的len 个元素到smem
+template<typename T>
+class SharedMemAllocator {
+public:
+    __device__ SharedMemAllocator(T* base): _base_ptr(base), _offset(0) {}
+
+    __device__ T* allocate(size_t size) {
+        T* ret = _base_ptr + _offset;
+        _offset += size;
+        return ret;
+    }
+
+private:
+    T* _base_ptr;
+    size_t _offset;
+};
+
 template <typename T>
 __device__ void copy_mem(
     const T* fmem,
@@ -224,7 +248,7 @@ __device__ void copy_mem(
 template <typename T>
 __device__ void copy_mem_stride(
         const T* fmem,
-        double* tmem,
+        RunningType* tmem,
         int len,
         int head_dim,
         int stride_in_element
@@ -237,13 +261,11 @@ __device__ void copy_mem_stride(
         int col_idx = idx % head_dim;
         tmem[idx] = fmem[row_idx * stride_in_element + col_idx];
     }
-
-    __syncthreads();
 }
 
 template <typename T>
 __device__ void copy_mem_stride_out(
-        const double* fmem,
+        const RunningType* fmem,
         T* tmem,
         int len,
         int head_dim,
@@ -257,25 +279,6 @@ __device__ void copy_mem_stride_out(
         int col_idx = idx % head_dim;
         tmem[row_idx * stride + col_idx] = fmem[idx];
     }
-
-    __syncthreads();
-}
-
-// 务必16字节对齐
-template <typename T>
-__device__ void
-clear_smem_vec(T* smem, int len) {
-    using Vec = int4;  // 16 bytes
-    Vec* vsmem = reinterpret_cast<Vec*>(smem);
-
-    int vec_len = len * sizeof(T) / sizeof(Vec);
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * blockDim.y;
-
-    for (int i = tid; i < vec_len; i += stride) {
-        vsmem[i] = make_int4(0, 0, 0, 0);
-    }
-    __syncthreads();
 }
 
 template <typename T>
@@ -291,9 +294,8 @@ reset_mem(T* smem, int len, T value) {
 }
 
 // causal mask
-template <typename T>
-__device__ void mask_S(
-    T* smem_s_block,
+__device__ void mask_s(
+    RunningType* smem_s_block,
     int block_start_row_idx,
     int block_start_col_idx,
     int block_rows_cnt,
@@ -312,17 +314,15 @@ __device__ void mask_S(
         int k = block_start_col_idx + j;
 
         if (k > q) {
-            smem_s_block[i * block_cols_cnt + j] = lowest<T>();
+            smem_s_block[i * block_cols_cnt + j] = lowest<RunningType>();
         }
     }
-
-    __syncthreads();
 }
 
-template<typename T>
-__device__ void row_max(
-    const T* smem,   // [row_cnt][col_cnt]
-    T* o,            // [row_cnt]
+__device__ void cal_m(
+    const RunningType* smem_input_s,   // [row_cnt][col_cnt]
+    const RunningType* smem_m,            // [row_cnt]
+    RunningType* smem_m_new,              // [row_cnt]
     int row_cnt,
     int col_cnt
 ) {
@@ -332,64 +332,29 @@ __device__ void row_max(
     int col_threads = blockDim.x;
     int row_stride  = blockDim.y;
 
-    // 32 x 32 使用 16 x 16 的 thread 处理
     for (int row = ty; row < row_cnt; row += row_stride) {
-        float local_max = lowest<float>();
+        RunningType local_max = lowest<RunningType>();
 
         for (int col = tx; col < col_cnt; col += col_threads) {
-            float v = double(smem[row * col_cnt + col]);
+            RunningType v = RunningType(smem[row * col_cnt + col]);
             local_max = v > local_max ? v : local_max;
         }
 
         unsigned mask = __activemask();
         for (int offset = col_threads >> 1; offset > 0; offset >>= 1) {
-            float other = __shfl_down_sync(mask, local_max, offset, col_threads);
+            RunningType other = __shfl_down_sync(mask, local_max, offset, col_threads);
             local_max = other > local_max ? other : local_max;
         }
 
         if (tx == 0) {
-            o[row] = T(local_max);
+            smem_m_new[row] = smem_m[row] > local_max ? smem_m[row] : local_max;
         }
     }
-    __syncthreads();
 }
 
-template <typename T>
-__device__ void row_sum(
-    const T* smem,   // [row_cnt][col_cnt]
-    T* o,            // [row_cnt]
-    int row_cnt,
-    int col_cnt
-) {
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int col_threads = blockDim.x;   // 期望为 1/2/4/8/16/32
-    int row_stride  = blockDim.y;
-
-    // 每个 ty 负责若干行：row = ty + k*row_stride
-    for (int row = ty; row < row_cnt; row += row_stride) {
-        float local_sum = 0.0f;
-
-        for (int col = tx; col < col_cnt; col += col_threads) {
-            local_sum += double(smem[row * col_cnt + col]);
-        }
-        unsigned mask = __activemask();
-        for (int offset = col_threads >> 1; offset > 0; offset >>= 1) {
-            local_sum += __shfl_down_sync(mask, local_sum, offset, col_threads);
-        }
-
-        if (tx == 0) {
-            o[row] = local_sum;
-        }
-    }
-    __syncthreads();
-}
-
-template<typename T>
 __device__ void safe_exp(
-    T* smem_s,
-    const T* smem_m,
+    RunningType* smem_s,
+    const RunningType* smem_m,
     int row_cnt,
     int col_cnt
 ) {
@@ -399,84 +364,49 @@ __device__ void safe_exp(
     for (int i = idx; i < row_cnt * col_cnt; i += stride) {
         int row = i / col_cnt;
         if (is_neg_inf(smem_s[i])) {
-            smem_s[i] = (T)0;
+            smem_s[i] = RunningType(0);
         } else {
-            float x = double(smem_s[i]) - double(smem_m[row]);
-            float e = expf(x);
-            smem_s[i] = (T)e;
+            RunningType x = smem_s[i] - smem_m[row];
+            RunningType e = expl(x);
+            smem_s[i] = e;
         }
     }
-    __syncthreads();
 }
-// 计算m_new l_new
-template<typename T>
-__device__ void calc_new_m_l(
-        const T* smem_l_ori,
-        const T* smem_l,
-        T* smem_l_new,
-        const T* smem_m_ori,
-        const T* smem_m,
-        T* smem_m_new,
-        int row_cnt
+
+__device__ void calc_bias_o(
+        RunningType* smem_o,
+        const RunningType* smem_m,
+        const RunningType* smem_m_new,
+        int m, int k
 ) {
     int idx = threadIdx.y * blockDim.x + threadIdx.x;
     int stride = blockDim.x * blockDim.y;
-
-    for (int i = idx; i < row_cnt; i += stride) {
-        smem_m_new[i] = smem_m_ori[i] > smem_m[i] ? smem_m_ori[i] : smem_m[i];
-        float h1 = double(smem_m_ori[i]) - double(smem_m_new[i]);
-        float h2 = double(smem_m[i]) - double(smem_m_new[i]);
-        smem_l_new[i] = T(expf(h1) * double(smem_l_ori[i]) + expf(h2) * double(smem_l[i]));
-    }
-
-    __syncthreads();
-}
-
-template<typename T>
-__device__ void calc_O(
-        const T* smem_l_new,
-        const T* smem_l_ori,
-        const T* smem_m,
-        const T* smem_m_new,
-        const T* smem_m_ori,
-        const T* smem_p,  // m * n
-        const T* smem_v,  // n * k
-        T* smem_O_ori,
-        T* smem_pv,
-        int m, int k, int n
-) {
-    int idx = threadIdx.y * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * blockDim.y;
-
-    block_gemm_shared<T, false>(smem_p, smem_v, smem_pv, m, n, k, 1.0f);
 
     for (int i = idx; i < m * k; i += stride) {
         int row_idx = i / k;
-        smem_O_ori[i] = T(
-                    (1.0f / double(smem_l_new[row_idx]) *
-                    ( double(smem_l_ori[row_idx]) * expf(double(smem_m_ori[row_idx]) - double(smem_m_new[row_idx])) * double(smem_O_ori[i])
-                      + expf(double(smem_m[row_idx]) - double(smem_m_new[row_idx])) * double(smem_pv[i])))
-                );
+        smem_o[i] *= expl(smem_m[row_idx] - smem_m_new[row_idx]);
     }
-
-    __syncthreads();
 }
 
-template<typename T>
-class SharedMemAllocator {
-public:
-    __device__ SharedMemAllocator(T* base): _base_ptr(base), _offset(0) {}
+__device__ void update_l(
+        const RunningType* smem_s, // [row_cnt * col_cnt]
+        const RunningType* smem_m, // [row_cnt]
+        const RunningType* smem_m_new, // [row_cnt]
+        RunningType* smem_l, // [row_cnt * col_cnt] just smem_s
+        int row_cnt,
+        int col_cnt) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * blockDim.y;
 
-    __device__ T* allocate(size_t size) {
-        T* ret = _base_ptr + _offset;
-        _offset += size;
-        return ret;
+   // 先求sum
+    for (int i = tid; i < row_cnt; i += row_stride) {
+        RunningType sum_s_row = RunningType(0);
+        for (int j = 0; j < col_cnt; ++j) {
+            sum_s_row += smem_s[i * col_cnt + j];
+        }
+        smem_l[i] = expl(smem_m[i] - smem_m_new[i]) * smem_l[i] + sum_s_row;
     }
-
-private:
-    T* _base_ptr;
-    size_t _offset;
-};
+}
 
 /**
  * 一个block内的线程合作计算 (Q_block * K^T) *V
@@ -487,53 +417,49 @@ private:
 **/
 template<typename T>
 void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int headIdx, int block_idx_q) {
+    int idx = threadIdx.y * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * blockDim.y;
+
     extern __shared__ char smem_[];
-    double* smem_as_T = reinterpret_cast<double*>(smem_);
-    SharedMemAllocator<double> allocator = SharedMemAllocator<double>(smem_as_T);
+    RunningType* smem_as_T = reinterpret_cast<RunningType*>(smem_);
+    SharedMemAllocator<RunningType> allocator = SharedMemAllocator<RunningType>(smem_as_T);
 
     // load Q 分块
     T* q_ptr_batch = param.q + param.size_per_q_batch * batchIdx;
     T* q_ptr_block = q_ptr_batch + block_idx_q * param.head_dim * param.query_heads * BlockSizeQ;
     T* q_ptr_head = q_ptr_block + headIdx * param.head_dim;
 
-    int q_block_real_len = param.target_seq_len - block_idx_q * BlockSizeQ < BlockSizeQ ?
-            param.target_seq_len - block_idx_q * BlockSizeQ : BlockSizeQ;
-
-    int64_t q_block_size = q_block_real_len * param.head_dim;
-    double* smem_q_block = allocator.allocate(BlockSizeQ * param.head_dim);
-    copy_mem_stride(q_ptr_head, smem_q_block, q_block_size, param.head_dim, param.query_heads * param.head_dim);
-
-    // 给KV分内存
-    int kv_head_idx = headIdx * param.kv_heads / param.query_heads;
-//    int kv_head_idx = headIdx % param.kv_heads;
-
     T* k_ptr_batch = param.k + param.size_per_kv_batch * batchIdx;
     T* v_ptr_batch = param.v + param.size_per_kv_batch * batchIdx;
 
-    double* smem_k_block = allocator.allocate(BlockSizeKV * param.head_dim);
-    double* smem_v_block = allocator.allocate(BlockSizeKV * param.head_dim);
+    int q_block_real_len = param.target_seq_len - block_idx_q * BlockSizeQ < BlockSizeQ ?
+            param.target_seq_len - block_idx_q * BlockSizeQ : BlockSizeQ;
+    int64_t q_block_size = q_block_real_len * param.head_dim;
+    // 给KV分内存
+    int kv_head_idx = headIdx * param.kv_heads / param.query_heads;
+    //    int kv_head_idx = headIdx % param.kv_heads;
 
-    // 中间变量分配内存
-    // o的size会变，取最大的BlockSizeQ * BlockSizeKV
-    double* smem_o_block = allocator.allocate(BlockSizeQ * param.head_dim);
+    RunningType* smem_q_block = allocator.allocate(BlockSizeQ * param.head_dim);
+    RunningType* smem_k_block = allocator.allocate(BlockSizeKV * param.head_dim);
+    RunningType* smem_v_block = allocator.allocate(BlockSizeKV * param.head_dim);
+    RunningType* smem_o_block = allocator.allocate(BlockSizeQ * param.head_dim);
+    RunningType* smem_l = allocator.allocate(BlockSizeQ);
+    RunningType* smem_m = allocator.allocate(BlockSizeQ);
+    RunningType* smem_m_new = allocator.allocate(BlockSizeQ);
+    RunningType* smem_s = allocator.allocate(BlockSizeQ * BlockSizeKV);
+    RunningType* smem_p = smem_s; // p and s store at the same place
+
     // 初始化
-    clear_smem_vec(smem_o_block, BlockSizeQ * param.head_dim);
+    reset_mem(smem_m, q_block_real_len, lowest<RunningType>());
+    reset_mem(smem_l, q_block_real_len, RunningType(0));
+    reset_mem(smem_o_block, BlockSizeQ * param.head_dim, RunningType(0));
 
-    double* smem_PV = allocator.allocate(BlockSizeQ * param.head_dim);
-    double* smem_m = allocator.allocate(BlockSizeQ);
-    double* smem_m_ori = allocator.allocate(BlockSizeQ);
-    reset_mem(smem_m_ori, q_block_real_len, lowest<double>());
-    double* smem_m_new = allocator.allocate(BlockSizeQ);
-
-    double* smem_l = allocator.allocate(BlockSizeQ);
-    double* smem_l_new = allocator.allocate(BlockSizeQ);
-    double* smem_l_ori = allocator.allocate(BlockSizeQ);
-    clear_smem_vec(smem_l_ori, BlockSizeQ);
-
-    double* smem_P =  allocator.allocate(BlockSizeQ * BlockSizeKV);
+    // load Q_block
+    copy_mem_stride(q_ptr_head, smem_q_block, q_block_size, param.head_dim, param.query_heads * param.head_dim);
+    __syncthreads();
 
     int head_dim = param.head_dim;
-    float factor = param.factor;
+    RunningType factor = param.factor;
     int kv_block_idx = 0;
     for (int64_t i = 0; i < param.src_seq_len; i += BlockSizeKV, kv_block_idx++) {
         // load K V 分块
@@ -547,25 +473,30 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
         copy_mem_stride(k_ptr_head, smem_k_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
         copy_mem_stride(v_ptr_head, smem_v_block, kv_block_real_size, param.head_dim, param.kv_heads * param.head_dim);
         // 计算S block = Q block x K block
-        block_gemm_shared<double, true>(smem_q_block, smem_k_block, smem_P, q_block_real_len, head_dim, kv_block_real_len, factor);
+        block_gemm_shared<true>(smem_q_block, smem_k_block, nullptr, smem_s, q_block_real_len, head_dim, kv_block_real_len, factor);
+        __syncthreads();
         // 设置掩码
         if (param.is_causal) {
-            mask_S(smem_P, block_idx_q * BlockSizeQ, kv_block_idx * BlockSizeKV, q_block_real_len, kv_block_real_len);
+            mask_s(smem_s, block_idx_q * BlockSizeQ, kv_block_idx * BlockSizeKV, q_block_real_len, kv_block_real_len);
+            __syncthreads();
         }
-        // 维护m
-        row_max(smem_P, smem_m, q_block_real_len, kv_block_real_len);
-        // 计算 P
-        safe_exp(smem_P, smem_m, q_block_real_len, kv_block_real_len);
-        row_sum(smem_P, smem_l, q_block_real_len, kv_block_real_len);
-        calc_new_m_l(smem_l_ori, smem_l, smem_l_new, smem_m_ori, smem_m, smem_m_new, q_block_real_len);
-        // 计算 O = P x V
-        calc_O(smem_l_new, smem_l_ori, smem_m, smem_m_new, smem_m_ori,
-               smem_P, smem_v_block, smem_o_block, smem_PV, q_block_real_len, param.head_dim, kv_block_real_len
-        );
 
-        // 写回m, l
-        copy_mem(smem_m_new, smem_m_ori, q_block_real_len);
-        copy_mem(smem_l_new, smem_l_ori, q_block_real_len);
+        cal_m(smem_s, smem_m, smem_m_new, q_block_real_len, kv_block_real_len);
+        __syncthreads();
+
+        safe_exp(smem_p, smem_m_new, q_block_real_len, kv_block_real_len);
+        __syncthreads();
+
+        update_l(smem_s, smem_m, smem_m_new, smem_l, q_block_real_len, kv_block_real_len);
+        __syncthreads();
+
+        calc_bias_o(smem_o, smem_m, smem_m_new, q_block_real_len, param.head_dim);
+        __syncthreads();
+
+        block_gemm_shared<false>(smem_p, smem_v, smem_o, smem_o, q_block_real_len, head_dim, kv_block_real_len, RunningType(1.0));
+
+        // update m
+        copy_mem(smem_m_new, smem_m, q_block_real_len);
     }
     // 写出O
     T* O_hbm = param.O
@@ -573,6 +504,7 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
             + block_idx_q * BlockSizeQ * param.head_dim * param.query_heads
             + headIdx * param.head_dim;
     copy_mem_stride_out(smem_o_block, O_hbm, q_block_size, param.head_dim, param.query_heads * param.head_dim);
+    __syncthreads();
 }
 
 template<typename T>
@@ -620,7 +552,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     dim3 grid(num_m_block, batch_size, query_heads);
 
     size_t total_shared_mem_used =
-            sizeof(double) * (3 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 6 * BlockSizeQ);
+            sizeof(RunningType) * (3 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 6 * BlockSizeQ);
 
     assert(total_shared_mem_used < smem_size);
 
