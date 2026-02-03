@@ -439,7 +439,6 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     RunningType* smem_as_T = reinterpret_cast<RunningType*>(smem_);
     SharedMemAllocator<RunningType> allocator = SharedMemAllocator<RunningType>(smem_as_T);
 
-    // load Q 分块
     T* q_ptr_batch = param.q + param.size_per_q_batch * batchIdx;
     T* q_ptr_block = q_ptr_batch + block_idx_q * param.head_dim * param.query_heads * BlockSizeQ;
     T* q_ptr_head = q_ptr_block + headIdx * param.head_dim;
@@ -450,7 +449,6 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     int q_block_real_len = param.target_seq_len - block_idx_q * BlockSizeQ < BlockSizeQ ?
             param.target_seq_len - block_idx_q * BlockSizeQ : BlockSizeQ;
     int64_t q_block_size = q_block_real_len * param.head_dim;
-    // 给KV分内存
     int kv_head_idx = headIdx * param.kv_heads / param.query_heads;
     //    int kv_head_idx = headIdx % param.kv_heads;
 
