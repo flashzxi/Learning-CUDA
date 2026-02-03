@@ -1,6 +1,5 @@
 #include <vector>
 #include <common/maca_fp16.h>
-#include <maca_runtime.h>
 #include "../tester/utils.h"
 #include <cassert>
 #include <cmath>
@@ -35,12 +34,12 @@ __device__ __forceinline__ bool is_neg_inf(double x) {
     return isinf(x) && signbit(x);
 }
 
-#define MACA_CHECK(call)                                                                    \
+#define mc_CHECK(call)                                                                    \
     {                                                                                       \
-        macaError_t err = call;                                                             \
-        if (err != macaSuccess) {                                                           \
-            std::cerr << "MACA error at " << __FILE__ << ":" << __LINE__                    \
-                      << " - " << macaGetErrorString(err) << "\n";                          \
+        mcError_t err = call;                                                             \
+        if (err != mcSuccess) {                                                           \
+            std::cerr << "mc error at " << __FILE__ << ":" << __LINE__                    \
+                      << " - " << mcGetErrorString(err) << "\n";                          \
             exit(-1);                                                                       \
         }                                                                                   \
     }
@@ -83,21 +82,21 @@ __global__ void gpu_trace(const T* input, T* output, size_t skip, size_t N) {
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     // TODO: Implement the trace function
-    T *maca_input, *maca_output;
+    T *mc_input, *mc_output;
     size_t size_bytes = rows * cols * sizeof(T);
     size_t value_cnt = std::min(rows, cols);
-    MACA_CHECK(macaMalloc(&maca_input, size_bytes));
-    MACA_CHECK(macaMalloc(&maca_output, sizeof(T)));
-    MACA_CHECK(macaMemset(maca_output, 0, sizeof(T)));
-    MACA_CHECK(macaMemcpy(maca_input, h_input.data(), size_bytes, macaMemcpyHostToDevice));
+    mc_CHECK(mcMalloc(&mc_input, size_bytes));
+    mc_CHECK(mcMalloc(&mc_output, sizeof(T)));
+    mc_CHECK(mcMemset(mc_output, 0, sizeof(T)));
+    mc_CHECK(mcMemcpy(mc_input, h_input.data(), size_bytes, mcMemcpyHostToDevice));
 
     dim3 block_dim(256);
     dim3 grid_dim(std::max(1ul, (value_cnt + block_dim.x - 1) / block_dim.x));
-    gpu_trace<<<grid_dim, block_dim>>>(maca_input, maca_output, cols + 1, value_cnt);
+    gpu_trace<<<grid_dim, block_dim>>>(mc_input, mc_output, cols + 1, value_cnt);
     T output;
-    MACA_CHECK(macaMemcpy(&output, maca_output, sizeof(T), macaMemcpyDeviceToHost));
-    MACA_CHECK(macaFree(maca_input));
-    MACA_CHECK(macaFree(maca_output));
+    mc_CHECK(mcMemcpy(&output, mc_output, sizeof(T), mcMemcpyDeviceToHost));
+    mc_CHECK(mcFree(mc_input));
+    mc_CHECK(mcFree(mc_output));
     return output;
 }
 
@@ -560,11 +559,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
 
     // 参考 https://zhuanlan.zhihu.com/p/645376942
-    int device;
-    macaGetDevice(&device);
-    macaDeviceProp prop{};
-    macaGetDeviceProperties(&prop, device);
-    size_t smem_size = prop.sharedMemPerBlock;
+
     dim3 block_dim(BlockDimX, BlockDimY);
     const int num_m_block = (target_seq_len + BlockSizeQ - 1) / BlockSizeQ;
     dim3 grid(num_m_block, batch_size, query_heads);
@@ -572,27 +567,26 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     size_t total_shared_mem_used =
             sizeof(RunningType) * (2 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 4 * BlockSizeQ);
 
-    assert(total_shared_mem_used < smem_size);
 
-    macaStream_t s0 = nullptr;
-    MACA_CHECK(macaStreamCreate(&s0));
+    mcStream_t s0 = nullptr;
+    mc_CHECK(mcStreamCreate(&s0));
 
-    T *maca_q, *maca_k, *maca_v, *maca_o;
-    MACA_CHECK(macaMallocAsync(&maca_q, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, s0));
-    MACA_CHECK(macaMallocAsync(&maca_o, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, s0));
-    MACA_CHECK(macaMallocAsync(&maca_k, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, s0));
-    MACA_CHECK(macaMallocAsync(&maca_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, s0));
+    T *mc_q, *mc_k, *mc_v, *mc_o;
+    mc_CHECK(mcMalloc(&mc_q, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim));
+    mc_CHECK(mcMalloc(&mc_o, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim));
+    mc_CHECK(mcMalloc(&mc_k, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
+    mc_CHECK(mcMalloc(&mc_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
 
-    MACA_CHECK(macaMemcpyAsync(maca_q, h_q.data(), sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, macaMemcpyHostToDevice, s0))
-    MACA_CHECK(macaMemcpyAsync(maca_k, h_k.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, macaMemcpyHostToDevice, s0))
-    MACA_CHECK(macaMemcpyAsync(maca_v, h_v.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, macaMemcpyHostToDevice, s0))
+    mc_CHECK(mcMemcpy(mc_q, h_q.data(), sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, mcMemcpyHostToDevice))
+    mc_CHECK(mcMemcpy(mc_k, h_k.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, mcMemcpyHostToDevice))
+    mc_CHECK(mcMemcpy(mc_v, h_v.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, mcMemcpyHostToDevice))
 
 
     FlashAttentionParam<T> param(
-            maca_q,
-            maca_k,
-            maca_v,
-            maca_o,
+            mc_q,
+            mc_k,
+            mc_v,
+            mc_o,
             batch_size,
             target_seq_len,
             src_seq_len,
@@ -601,17 +595,17 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
             head_dim,
             is_causal);
 
-    flash_kernel<<<grid, block_dim, total_shared_mem_used, s0>>>(param);
-    MACA_CHECK(macaMemcpyAsync(h_o.data(), param.O, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, macaMemcpyDeviceToHost, s0))
+    flash_kernel<<<grid, block_dim, total_shared_mem_used>>>(param);
+    mc_CHECK(mcMemcpy(h_o.data(), param.O, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, mcMemcpyDeviceToHost))
 
-    MACA_CHECK(macaStreamSynchronize(s0));
+    mc_CHECK(mcStreamSynchronize(s0));
 
-    MACA_CHECK(macaFreeAsync(maca_q, s0));
-    MACA_CHECK(macaFreeAsync(maca_k, s0));
-    MACA_CHECK(macaFreeAsync(maca_v, s0));
-    MACA_CHECK(macaFreeAsync(maca_o, s0));
-    MACA_CHECK(macaStreamSynchronize(s0));
-    MACA_CHECK(macaStreamDestroy(s0));
+    mc_CHECK(mcFree(mc_q));
+    mc_CHECK(mcFree(mc_k));
+    mc_CHECK(mcFree(mc_v));
+    mc_CHECK(mcFree(mc_o));
+    mc_CHECK(mcStreamSynchronize(s0));
+    mc_CHECK(mcStreamDestroy(s0));
 }
 
 // *********************************************************************
