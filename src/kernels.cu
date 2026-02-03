@@ -101,11 +101,14 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     return output;
 }
 
-// Kahan summation for better numerical stability
-__device__ __forceinline__ RunningType kahan_sum(RunningType sum, RunningType input, RunningType& compensation) {
-    RunningType y = input - compensation;
-    RunningType t = sum + y;
-    compensation = (t - sum) - y;
+// Neumaier summation for better numerical stability
+__device__ __forceinline__ RunningType neumaier_sum(RunningType sum, RunningType input, RunningType& compensation) {
+    RunningType t = sum + input;
+    if (fabs(sum) >= fabs(input)) {
+        compensation += (sum - t) + input;
+    } else {
+        compensation += (input - t) + sum;
+    }
     return t;
 }
 
@@ -135,7 +138,7 @@ __device__ void block_gemm_shared(
                 } else {
                     term = A[row * k + kk] * B[col * k + kk];
                 }
-                acc = kahan_sum(acc, term, compensation);
+                acc = neumaier_sum(acc, term, compensation);
             }
             acc *= factor;
 
@@ -403,7 +406,7 @@ __device__ void update_l(
 
         // 先按顺序累加，减少数值误差
         for (int j = 0; j < col_cnt; ++j) {
-            sum_s_row = kahan_sum(sum_s_row, smem_s[i * col_cnt + j], compensation);
+            sum_s_row = neumaier_sum(sum_s_row, smem_s[i * col_cnt + j], compensation);
         }
         smem_l[i] = exp(smem_m[i] - smem_m_new[i]) * smem_l[i] + sum_s_row;
     }
