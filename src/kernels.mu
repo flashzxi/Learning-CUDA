@@ -66,6 +66,37 @@ __global__ void gpu_trace(const T* input, T* output, size_t skip, size_t N) {
     }
 }
 
+#define CUDA_CHECK(call)                                                                    \
+    {                                                                                       \
+        musaError_t err = call;                                                             \
+        if (err != musaSuccess) {                                                           \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__                    \
+                      << " - " << musaGetErrorString(err) << "\n";                          \
+            exit(-1);                                                                       \
+        }                                                                                   \
+    }
+
+template <typename T>
+__global__ void gpu_trace(const T* input, T* output, size_t skip, size_t N) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    size_t tid = threadIdx.x;
+    const unsigned mask = __activemask();
+
+    T sum = 0;
+    for (size_t i = idx; i < N; i += blockDim.x * gridDim.x) {
+        // 初始化时获取全部的对角线元素，之后就是课上说的求和问题
+        sum += input[i * skip];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+
+    if (tid % 32 == 0) {
+        atomicAdd(output, sum);
+    }
+}
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -538,7 +569,7 @@ void __global__ flash_kernel(FlashAttentionParam<T> param) {
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- * 
+ *
  * @tparam T Data type (float) for input/output tensors
  * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
@@ -546,7 +577,7 @@ void __global__ flash_kernel(FlashAttentionParam<T> param) {
  * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
+ * @param[in] src_seq_len Source sequence length
  * @param[in] query_heads Number of query attention heads
  * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
