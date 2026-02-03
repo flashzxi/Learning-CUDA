@@ -4,6 +4,7 @@
 #include "../tester/utils.h"
 #include <cassert>
 #include <cmath>
+#include <type_traits>
 
 #define BlockSizeQ 32
 #define BlockSizeKV 32
@@ -100,6 +101,17 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     return output;
 }
 
+// Neumaier summation for better numerical stability
+__device__ __forceinline__ RunningType neumaier_sum(RunningType sum, RunningType input, RunningType& compensation) {
+    RunningType t = sum + input;
+    if (fabs(sum) >= fabs(input)) {
+        compensation += (sum - t) + input;
+    } else {
+        compensation += (input - t) + sum;
+    }
+    return t;
+}
+
 // 单个block的线程合作计算 C = A * B + bias
 template <bool TransposeB>
 __device__ void block_gemm_shared(
@@ -117,12 +129,16 @@ __device__ void block_gemm_shared(
     for (int row = ty; row < m; row += dimRow) {
         for (int col = tx; col < n; col += dimCol) {
             RunningType acc = RunningType(0);
+            RunningType compensation = RunningType(0);  // for Kahan summation
+
             for (int kk = 0; kk < k; ++kk) {
+                RunningType term;
                 if constexpr (!TransposeB) {
-                    acc += A[row * k + kk] * B[kk * n + col];
+                    term = A[row * k + kk] * B[kk * n + col];
                 } else {
-                    acc += A[row * k + kk] * B[col * k + kk];
+                    term = A[row * k + kk] * B[col * k + kk];
                 }
+                acc = neumaier_sum(acc, term, compensation);
             }
             acc *= factor;
 
@@ -343,8 +359,17 @@ __device__ void safe_exp(
             smem_s[i] = RunningType(0);
         } else {
             RunningType x = smem_s[i] - smem_m[row];
-            RunningType e = exp(x);
-            smem_s[i] = e;
+            // 使用更高精度的exp函数并限制范围防止溢出
+            if (x < RunningType(-30)) {
+                smem_s[i] = RunningType(0);
+            } else if constexpr (std::is_same_v<RunningType, float>) {
+                smem_s[i] = expf(x);
+            } else if constexpr (std::is_same_v<RunningType, double>) {
+                smem_s[i] = exp(x);
+            } else {
+                // For half, use float then convert
+                smem_s[i] = __float2half(expf(__half2float(x)));
+            }
         }
     }
 }
@@ -374,11 +399,14 @@ __device__ void update_l(
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
     int stride = blockDim.x * blockDim.y;
 
-    // 先求sum
+    // 使用Kahan求和减少累积误差
     for (int i = tid; i < row_cnt; i += stride) {
         RunningType sum_s_row = RunningType(0);
+        RunningType compensation = RunningType(0);
+
+        // 先按顺序累加，减少数值误差
         for (int j = 0; j < col_cnt; ++j) {
-            sum_s_row += smem_s[i * col_cnt + j];
+            sum_s_row = neumaier_sum(sum_s_row, smem_s[i * col_cnt + j], compensation);
         }
         smem_l[i] = exp(smem_m[i] - smem_m_new[i]) * smem_l[i] + sum_s_row;
     }
@@ -411,7 +439,6 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     RunningType* smem_as_T = reinterpret_cast<RunningType*>(smem_);
     SharedMemAllocator<RunningType> allocator = SharedMemAllocator<RunningType>(smem_as_T);
 
-    // load Q 分块
     T* q_ptr_batch = param.q + param.size_per_q_batch * batchIdx;
     T* q_ptr_block = q_ptr_batch + block_idx_q * param.head_dim * param.query_heads * BlockSizeQ;
     T* q_ptr_head = q_ptr_block + headIdx * param.head_dim;
@@ -422,7 +449,6 @@ void __device__ flash_block(FlashAttentionParam<T> param, int batchIdx, int head
     int q_block_real_len = param.target_seq_len - block_idx_q * BlockSizeQ < BlockSizeQ ?
             param.target_seq_len - block_idx_q * BlockSizeQ : BlockSizeQ;
     int64_t q_block_size = q_block_real_len * param.head_dim;
-    // 给KV分内存
     int kv_head_idx = headIdx * param.kv_heads / param.query_heads;
     //    int kv_head_idx = headIdx % param.kv_heads;
 
