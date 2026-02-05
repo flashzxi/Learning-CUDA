@@ -35,35 +35,16 @@ __device__ __forceinline__ bool is_neg_inf(double x) {
     return isinf(x) && signbit(x);
 }
 
-#define CUDA_CHECK(call)                                                                    \
-    {                                                                                       \
-        musaError_t err = call;                                                             \
-        if (err != musaSuccess) {                                                           \
-            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__                    \
-                      << " - " << musaGetErrorString(err) << "\n";                          \
-            exit(-1);                                                                       \
-        }                                                                                   \
-    }
+__device__ __forceinline__ half real_exp(half v) {
+    return __float2half(expf(__half2float(v)));
+}
 
-template <typename T>
-__global__ void gpu_trace(const T* input, T* output, size_t skip, size_t N) {
-    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
-    size_t tid = threadIdx.x;
-    const unsigned mask = __activemask();
+__device__ __forceinline__ float real_exp(float v) {
+    return expf(v);
+}
 
-    T sum = 0;
-    for (size_t i = idx; i < N; i += blockDim.x * gridDim.x) {
-        // 初始化时获取全部的对角线元素，之后就是课上说的求和问题
-        sum += input[i * skip];
-    }
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(mask, sum, offset);
-    }
-
-    if (tid % 32 == 0) {
-        atomicAdd(output, sum);
-    }
+__device__ __forceinline__ double real_exp(double v) {
+    return exp(v);
 }
 
 #define CUDA_CHECK(call)                                                                    \
@@ -164,7 +145,7 @@ __device__ void block_gemm_shared(
 
             for (int kk = 0; kk < k; ++kk) {
                 RunningType term;
-                if constexpr (!TransposeB) {
+                if (!TransposeB) {
                     term = A[row * k + kk] * B[kk * n + col];
                 } else {
                     term = A[row * k + kk] * B[col * k + kk];
@@ -393,13 +374,8 @@ __device__ void safe_exp(
             // 使用更高精度的exp函数并限制范围防止溢出
             if (x < RunningType(-30)) {
                 smem_s[i] = RunningType(0);
-            } else if constexpr (std::is_same_v<RunningType, float>) {
-                smem_s[i] = expf(x);
-            } else if constexpr (std::is_same_v<RunningType, double>) {
-                smem_s[i] = exp(x);
             } else {
-                // For half, use float then convert
-                smem_s[i] = __float2half(expf(__half2float(x)));
+                smem_s[i] = real_exp(x);
             }
         }
     }
@@ -598,18 +574,16 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     size_t total_shared_mem_used =
             sizeof(RunningType) * (2 * BlockSizeQ * head_dim + 2 * BlockSizeKV * head_dim + 1 * BlockSizeKV * BlockSizeQ + 4 * BlockSizeQ);
 
-    musaStream_t s0 = nullptr;
-    CUDA_CHECK(musaStreamCreate(&s0));
-
     T *musa_q, *musa_k, *musa_v, *musa_o;
-    CUDA_CHECK(musaMallocAsync(&musa_q, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, s0));
-    CUDA_CHECK(musaMallocAsync(&musa_o, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, s0));
-    CUDA_CHECK(musaMallocAsync(&musa_k, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, s0));
-    CUDA_CHECK(musaMallocAsync(&musa_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, s0));
+    CUDA_CHECK(musaMalloc(&musa_q, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim));
+    CUDA_CHECK(musaMalloc(&musa_o, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim));
+    CUDA_CHECK(musaMalloc(&musa_k, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
+    CUDA_CHECK(musaMalloc(&musa_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
+    CUDA_CHECK(musaMalloc(&musa_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
 
-    CUDA_CHECK(musaMemcpyAsync(musa_q, h_q.data(), sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, musaMemcpyHostToDevice, s0))
-    CUDA_CHECK(musaMemcpyAsync(musa_k, h_k.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, musaMemcpyHostToDevice, s0))
-    CUDA_CHECK(musaMemcpyAsync(musa_v, h_v.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, musaMemcpyHostToDevice, s0))
+    CUDA_CHECK(musaMemcpy(musa_q, h_q.data(), sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, musaMemcpyHostToDevice))
+    CUDA_CHECK(musaMemcpy(musa_k, h_k.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, musaMemcpyHostToDevice))
+    CUDA_CHECK(musaMemcpy(musa_v, h_v.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, musaMemcpyHostToDevice))
 
 
     FlashAttentionParam<T> param(
@@ -625,17 +599,13 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
             head_dim,
             is_causal);
 
-    flash_kernel<<<grid, block_dim, total_shared_mem_used, s0>>>(param);
-    CUDA_CHECK(musaMemcpyAsync(h_o.data(), param.O, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, musaMemcpyDeviceToHost, s0))
+    flash_kernel<<<grid, block_dim, total_shared_mem_used>>>(param);
+    CUDA_CHECK(musaMemcpy(h_o.data(), param.O, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, musaMemcpyDeviceToHost))
 
-    CUDA_CHECK(musaStreamSynchronize(s0));
-
-    CUDA_CHECK(musaFreeAsync(musa_q, s0));
-    CUDA_CHECK(musaFreeAsync(musa_k, s0));
-    CUDA_CHECK(musaFreeAsync(musa_v, s0));
-    CUDA_CHECK(musaFreeAsync(musa_o, s0));
-    CUDA_CHECK(musaStreamSynchronize(s0));
-    CUDA_CHECK(musaStreamDestroy(s0));
+    CUDA_CHECK(musaFree(musa_q));
+    CUDA_CHECK(musaFree(musa_k));
+    CUDA_CHECK(musaFree(musa_v));
+    CUDA_CHECK(musaFree(musa_o));
 }
 
 // *********************************************************************
