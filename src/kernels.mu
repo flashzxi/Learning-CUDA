@@ -36,7 +36,7 @@ __device__ __forceinline__ bool is_neg_inf(double x) {
 }
 
 __device__ __forceinline__ half real_exp(half v) {
-    return
+    return __float2half(expf(__half2float(x)));
 }
 
 __device__ __forceinline__ float real_exp(float v) {
@@ -579,6 +579,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     CUDA_CHECK(musaMalloc(&musa_o, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim));
     CUDA_CHECK(musaMalloc(&musa_k, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
     CUDA_CHECK(musaMalloc(&musa_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
+    CUDA_CHECK(musaMalloc(&musa_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
 
     CUDA_CHECK(musaMemcpy(musa_q, h_q.data(), sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, musaMemcpyHostToDevice))
     CUDA_CHECK(musaMemcpy(musa_k, h_k.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, musaMemcpyHostToDevice))
@@ -600,8 +601,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
     flash_kernel<<<grid, block_dim, total_shared_mem_used>>>(param);
     CUDA_CHECK(musaMemcpy(h_o.data(), param.O, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, musaMemcpyDeviceToHost))
-
-    CUDA_CHECK(musaStreamSynchronize(s0));
 
     CUDA_CHECK(musaFree(musa_q));
     CUDA_CHECK(musaFree(musa_k));
