@@ -221,7 +221,7 @@ private:
 };
 
 template <typename T>
-__device__ void copy_mem(
+__device__ __forceinline__ void copy_mem(
     const T* fmem,
     T* tmem,
     int len
@@ -237,7 +237,7 @@ __device__ void copy_mem(
 }
 
 template <typename T>
-__device__ void copy_mem_stride(
+__device__ __forceinline__ void copy_mem_stride(
         const T* fmem,
         RunningType* tmem,
         int len,
@@ -255,7 +255,7 @@ __device__ void copy_mem_stride(
 }
 
 template <typename T>
-__device__ void copy_mem_stride_out(
+__device__ __forceinline__ void copy_mem_stride_out(
         const RunningType* fmem,
         T* tmem,
         int len,
@@ -273,7 +273,7 @@ __device__ void copy_mem_stride_out(
 }
 
 template <typename T>
-__device__ void
+__device__ __forceinline__ void
 reset_mem(T* smem, int len, T value) {
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
     int stride = blockDim.x * blockDim.y;
@@ -285,7 +285,7 @@ reset_mem(T* smem, int len, T value) {
 }
 
 // causal mask
-__device__ void mask_s(
+__device__ __forceinline__ void mask_s(
     RunningType* smem_s_block,
     int block_start_row_idx,
     int block_start_col_idx,
@@ -311,7 +311,7 @@ __device__ void mask_s(
     }
 }
 
-__device__ void cal_m(
+__device__ __forceinline__ void cal_m(
     const RunningType* smem_input_s,   // [row_cnt][col_cnt]
     const RunningType* smem_m,            // [row_cnt]
     RunningType* smem_m_new,              // [row_cnt]
@@ -344,7 +344,7 @@ __device__ void cal_m(
     }
 }
 
-__device__ void safe_exp(
+__device__ __forceinline__ void safe_exp(
     RunningType* smem_s,
     const RunningType* smem_m,
     int row_cnt,
@@ -374,7 +374,7 @@ __device__ void safe_exp(
     }
 }
 
-__device__ void calc_bias_o(
+__device__ __forceinline__ void calc_bias_o(
         RunningType* smem_o,
         const RunningType* smem_m,
         const RunningType* smem_m_new,
@@ -389,7 +389,7 @@ __device__ void calc_bias_o(
     }
 }
 
-__device__ void update_l(
+__device__ __forceinline__ void update_l(
         const RunningType* smem_s, // [row_cnt * col_cnt]
         const RunningType* smem_m, // [row_cnt]
         const RunningType* smem_m_new, // [row_cnt]
@@ -412,7 +412,7 @@ __device__ void update_l(
     }
 }
 
-__device__ void update_o(
+__device__ __forceinline__ void update_o(
         RunningType* smem_o_block,
         const RunningType* smem_l,
         int row_cnt,
