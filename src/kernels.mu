@@ -36,7 +36,7 @@ __device__ __forceinline__ bool is_neg_inf(double x) {
 }
 
 __device__ __forceinline__ half real_exp(half v) {
-    return __float2half(expf(__half2float(x)));
+    return __float2half(expf(__half2float(v)));
 }
 
 __device__ __forceinline__ float real_exp(float v) {
