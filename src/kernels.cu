@@ -574,6 +574,40 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
     assert(total_shared_mem_used < smem_size);
 
+#ifdef PLATFORM_ILUVATAR
+    // 不支持stream
+    T *cuda_q, *cuda_k, *cuda_v, *cuda_o;
+    CUDA_CHECK(cudaMalloc(&cuda_q, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim));
+    CUDA_CHECK(cudaMalloc(&cuda_o, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim));
+    CUDA_CHECK(cudaMalloc(&cuda_k, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
+    CUDA_CHECK(cudaMalloc(&cuda_v, sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim));
+
+    CUDA_CHECK(cudaMemcpy(cuda_q, h_q.data(), sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, cudaMemcpyHostToDevice))
+    CUDA_CHECK(cudaMemcpy(cuda_k, h_k.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, cudaMemcpyHostToDevice))
+    CUDA_CHECK(cudaMemcpy(cuda_v, h_v.data(), sizeof(T) * batch_size * src_seq_len * kv_heads * head_dim, cudaMemcpyHostToDevice))
+
+
+    FlashAttentionParam<T> param(
+            cuda_q,
+            cuda_k,
+            cuda_v,
+            cuda_o,
+            batch_size,
+            target_seq_len,
+            src_seq_len,
+            query_heads,
+            kv_heads,
+            head_dim,
+            is_causal);
+
+    flash_kernel<<<grid, block_dim, total_shared_mem_used>>>(param);
+    CUDA_CHECK(cudaMemcpy(h_o.data(), param.O, sizeof(T) * batch_size * target_seq_len * query_heads * head_dim, cudaMemcpyDeviceToHost))
+
+    CUDA_CHECK(cudaFree(cuda_q));
+    CUDA_CHECK(cudaFree(cuda_k));
+    CUDA_CHECK(cudaFree(cuda_v));
+    CUDA_CHECK(cudaFree(cuda_o));
+#else
     cudaStream_t s0 = nullptr;
     CUDA_CHECK(cudaStreamCreate(&s0));
 
@@ -612,6 +646,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     CUDA_CHECK(cudaFreeAsync(cuda_o, s0));
     CUDA_CHECK(cudaStreamSynchronize(s0));
     CUDA_CHECK(cudaStreamDestroy(s0));
+#endif
 }
 
 // *********************************************************************
